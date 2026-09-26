@@ -49,6 +49,14 @@
   梁底高程−潮高≥船舶水面以上高度+净空富余（等号可通行），求两条件的连续
   交集（合并相接区间）再减去通航时长，返回全部可出发时段及最早时刻；仅在
   预报覆盖范围内计算，预报更正后实时重算；港口或桥梁配置不存在时明确报错。
+- 港口潮位预警：PUT/GET /ports/{id}/tide-alert-rule 保存、读取每港一条规则
+  （高潮或低潮方向、触发潮高、解除潮高、最短持续分钟；高潮解除阈值严格低于
+  触发阈值，低潮反之，时长非负）；GET /ports/{id}/tide-alerts 按最新预报
+  相邻点线性插值，仅在预报覆盖区间内扫描预警时段——首点已达触发阈值即从首点
+  预警，否则首次达到触发阈值进入、达到解除阈值才结束，交点作为边界；覆盖结束
+  仍未解除则标记未闭合。仅返回持续达到最短要求的时段（按起点排序，含起止时刻、
+  未闭合标记与期间极值潮高）；预报不足两点返回空列表。查询只读，预报更正后
+  实时重算。
 """
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -80,6 +88,9 @@ from .schemas import (
     ReservationCreate,
     ReservationOut,
     ReservationReschedule,
+    TideAlertOut,
+    TideAlertRuleOut,
+    TideAlertRuleUpsert,
     TideForecastOut,
     TideForecastUpsert,
     TideObservationOut,
@@ -98,6 +109,7 @@ from .tides import (
     max_supported_required_depth,
     merge_forecast_points,
     observation_anomalies,
+    tide_alert_periods,
 )
 
 @asynccontextmanager
@@ -108,7 +120,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="港口潮汐通航窗口 API",
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -516,6 +528,100 @@ def query_bridge_windows(
         earliest_departure=earliest,
         windows=[DepartureWindow(start=s, end=e) for s, e in windows],
     )
+
+
+# ---------------------------------------------------------------------------
+# 港口潮位预警
+# ---------------------------------------------------------------------------
+
+
+def _get_tide_alert_rule_or_404(db: Connection, port_id: int):
+    row = db.execute(
+        "SELECT direction, trigger_height, release_height, min_duration_minutes "
+        "FROM tide_alert_rules WHERE port_id = ?",
+        (port_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"港口 {port_id} 未配置潮位预警规则"
+        )
+    return row
+
+
+@app.put("/ports/{port_id}/tide-alert-rule", response_model=TideAlertRuleOut)
+def set_tide_alert_rule(
+    port_id: int, payload: TideAlertRuleUpsert, db: Connection = Depends(get_db)
+):
+    """设置/更正港口潮位预警规则：每港一条，重复提交即覆盖。
+
+    高潮预警解除潮高须严格低于触发潮高，低潮预警反之；最短持续分钟非负。
+    """
+    _get_port_or_404(db, port_id)
+    db.execute(
+        """
+        INSERT INTO tide_alert_rules (
+            port_id, direction, trigger_height, release_height, min_duration_minutes
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (port_id)
+        DO UPDATE SET direction = excluded.direction,
+                      trigger_height = excluded.trigger_height,
+                      release_height = excluded.release_height,
+                      min_duration_minutes = excluded.min_duration_minutes
+        """,
+        (
+            port_id,
+            payload.direction,
+            payload.trigger_height,
+            payload.release_height,
+            payload.min_duration_minutes,
+        ),
+    )
+    return TideAlertRuleOut(
+        port_id=port_id,
+        direction=payload.direction,
+        trigger_height=payload.trigger_height,
+        release_height=payload.release_height,
+        min_duration_minutes=payload.min_duration_minutes,
+    )
+
+
+@app.get("/ports/{port_id}/tide-alert-rule", response_model=TideAlertRuleOut)
+def get_tide_alert_rule(port_id: int, db: Connection = Depends(get_db)):
+    """查询港口潮位预警规则；港口或规则不存在时返回 404。"""
+    _get_port_or_404(db, port_id)
+    row = _get_tide_alert_rule_or_404(db, port_id)
+    return TideAlertRuleOut(port_id=port_id, **dict(row))
+
+
+@app.get("/ports/{port_id}/tide-alerts", response_model=list[TideAlertOut])
+def get_tide_alerts(port_id: int, db: Connection = Depends(get_db)):
+    """按最新预报扫描潮位预警时段（只读，预报更正后实时重算）。
+
+    按该港口最新潮高预报的相邻点线性插值，仅在预报覆盖区间内扫描：首点
+    已达到触发阈值则从首点预警，否则首次达到触发阈值进入预警，达到解除
+    阈值才结束（交点作为边界）；覆盖结束仍未解除则标记未闭合。仅返回持续
+    时间达到最短要求的时段，按起点升序，给出起止时刻、未闭合标记及期间
+    极值潮高（高潮取最高、低潮取最低）；预报不足两点返回空列表。
+    """
+    _get_port_or_404(db, port_id)
+    rule = _get_tide_alert_rule_or_404(db, port_id)
+    points = _forecast_points(db, port_id)
+    periods = tide_alert_periods(
+        points,
+        direction=rule["direction"],
+        trigger_height=rule["trigger_height"],
+        release_height=rule["release_height"],
+        min_duration_seconds=rule["min_duration_minutes"] * 60,
+    )
+    return [
+        TideAlertOut(
+            start=start,
+            end=end,
+            unclosed=unclosed,
+            extreme_height=extreme,
+        )
+        for start, end, unclosed, extreme in periods
+    ]
 
 
 # ---------------------------------------------------------------------------

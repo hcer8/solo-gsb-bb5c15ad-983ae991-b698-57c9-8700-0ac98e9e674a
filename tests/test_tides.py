@@ -14,6 +14,7 @@ from app.tides import (
     merge_forecast_points,
     observation_anomalies,
     sufficient_depth_windows,
+    tide_alert_periods,
 )
 
 BASE = datetime(2026, 9, 24, tzinfo=timezone.utc)
@@ -920,3 +921,169 @@ def test_bridge_windows_fewer_than_two_points_no_coverage():
     )
     assert deps == []
     assert earliest is None
+
+
+# ---------------------------------------------------------------------------
+# 港口潮位预警 tide_alert_periods
+# ---------------------------------------------------------------------------
+
+
+def test_tide_alert_high_basic_period():
+    # 潮高 0→2→0（每小时）：触发 1.0，解除 0.5
+    # 上升交点 00:30；下降段 2→0 中 0.5 的交点在 01:45；极值 2.0
+    periods = tide_alert_periods(pts(0, 2, 0), "high", 1.0, 0.5, 0)
+    assert periods == [
+        (
+            BASE + timedelta(minutes=30),
+            BASE + timedelta(hours=1, minutes=45),
+            False,
+            2.0,
+        )
+    ]
+
+
+def test_tide_alert_high_first_point_already_triggered():
+    # 首点 2.0 已达触发阈值：从首点 00:00 预警，0.5 交点 00:45 解除
+    periods = tide_alert_periods(pts(2, 0), "high", 1.0, 0.5, 0)
+    assert periods == [
+        (BASE, BASE + timedelta(minutes=45), False, 2.0)
+    ]
+
+
+def test_tide_alert_high_unclosed_at_coverage_end():
+    # 0→2 持续上升，覆盖结束（01:00）仍在预警：未闭合，终点取末时刻
+    periods = tide_alert_periods(pts(0, 2), "high", 1.0, 0.5, 0)
+    assert periods == [
+        (
+            BASE + timedelta(minutes=30),
+            BASE + timedelta(hours=1),
+            True,
+            2.0,
+        )
+    ]
+
+
+def test_tide_alert_first_point_triggered_unclosed():
+    # 首点恰为触发阈值且之后持续报警：整个覆盖区间未闭合
+    periods = tide_alert_periods(pts(1.0, 1.0), "high", 1.0, 0.5, 0)
+    assert periods == [(BASE, BASE + timedelta(hours=1), True, 1.0)]
+
+
+def test_tide_alert_min_duration_filters_short_period():
+    # 时段长 75 分钟：最短 75 分钟（含等号）保留，76 分钟舍弃
+    short = tide_alert_periods(pts(0, 2, 0), "high", 1.0, 0.5, 75 * 60)
+    assert len(short) == 1
+    assert short[0][1] - short[0][0] == timedelta(minutes=75)
+    assert tide_alert_periods(pts(0, 2, 0), "high", 1.0, 0.5, 76 * 60) == []
+    # 最短时长为 0：不过滤
+    assert len(tide_alert_periods(pts(0, 2, 0), "high", 1.0, 0.5, 0)) == 1
+
+
+def test_tide_alert_low_basic_period():
+    # 低潮：潮高 2→0→2，触发 1.0，解除 1.5
+    # 下降交点 00:30；上升段 0→2 中 1.5 的交点在 01:45；极值（最低）0.0
+    periods = tide_alert_periods(pts(2, 0, 2), "low", 1.0, 1.5, 0)
+    assert periods == [
+        (
+            BASE + timedelta(minutes=30),
+            BASE + timedelta(hours=1, minutes=45),
+            False,
+            0.0,
+        )
+    ]
+
+
+def test_tide_alert_low_unclosed_and_first_triggered():
+    # 首点 0.0 已低于触发阈值 1.0，全程不解除 → 未闭合
+    periods = tide_alert_periods(pts(0, 0), "low", 1.0, 1.5, 0)
+    assert periods == [(BASE, BASE + timedelta(hours=1), True, 0.0)]
+
+
+def test_tide_alert_fewer_than_two_forecasts_empty():
+    assert tide_alert_periods([], "high", 1.0, 0.5, 0) == []
+    assert tide_alert_periods(pts(1), "high", 1.0, 0.5, 0) == []
+
+
+def test_tide_alert_multiple_periods_sorted_ascending():
+    # 两个高潮周期：0→2→0→2→0
+    periods = tide_alert_periods(pts(0, 2, 0, 2, 0), "high", 1.0, 0.5, 0)
+    assert [(s, e) for s, e, _, _ in periods] == [
+        (BASE + timedelta(minutes=30), BASE + timedelta(hours=1, minutes=45)),
+        (BASE + timedelta(hours=2, minutes=30), BASE + timedelta(hours=3, minutes=45)),
+    ]
+    assert periods == sorted(periods, key=lambda p: p[0])
+    assert all(not unclosed for _, _, unclosed, _ in periods)
+    assert [ext for *_, ext in periods] == [2.0, 2.0]
+
+
+def test_tide_alert_trigger_and_release_exactly_at_knots():
+    # 0→1→2→1→0：01:00 折点恰达触发 1.0（从折点开始）；
+    # 末段 1→0 中 0.5 交点在该段中点 03:30
+    periods = tide_alert_periods(pts(0, 1, 2, 1, 0), "high", 1.0, 0.5, 0)
+    assert periods == [
+        (
+            BASE + timedelta(hours=1),
+            BASE + timedelta(hours=3, minutes=30),
+            False,
+            2.0,
+        )
+    ]
+    # 解除阈值恰落在折点：0,2,0.5,0 → 02:00 折点解除
+    periods = tide_alert_periods(pts(0, 2, 0.5, 0), "high", 1.0, 0.5, 0)
+    assert periods == [
+        (
+            BASE + timedelta(minutes=30),
+            BASE + timedelta(hours=2),
+            False,
+            2.0,
+        )
+    ]
+
+
+def test_tide_alert_reopens_at_exact_trigger_knot():
+    # 02:00 折点 0.5 解除后，03:00 折点恰为 1.0，在该折点重新进入预警
+    periods = tide_alert_periods(pts(0, 2, 0.5, 1, 2, 0.5), "high", 1.0, 0.5, 0)
+    assert [(s, e, unclosed) for s, e, unclosed, _ in periods] == [
+        (BASE + timedelta(minutes=30), BASE + timedelta(hours=2), False),
+        (BASE + timedelta(hours=3), BASE + timedelta(hours=5), False),
+    ]
+
+
+def test_tide_alert_low_exact_knot_period():
+    # 2→1→2：01:00 折点恰为低潮触发 1.0，上升段 1→2 中 1.5 交点 01:30
+    periods = tide_alert_periods(pts(2, 1, 2), "low", 1.0, 1.5, 0)
+    assert periods == [
+        (
+            BASE + timedelta(hours=1),
+            BASE + timedelta(hours=1, minutes=30),
+            False,
+            1.0,
+        )
+    ]
+
+
+def test_tide_alert_never_triggered_empty():
+    assert tide_alert_periods(pts(0.1, 0.2), "high", 1.0, 0.5, 0) == []
+    assert tide_alert_periods(pts(2.1, 2.2), "low", 1.0, 1.5, 0) == []
+
+
+def test_tide_alert_extreme_over_plateau():
+    # 平顶 0→2→2→0：极值 2.0；平谷 2→0→0→2 低潮：极值 0.0
+    high = tide_alert_periods(pts(0, 2, 2, 0), "high", 1.0, 0.5, 0)
+    assert high[0][3] == 2.0
+    low = tide_alert_periods(pts(2, 0, 0, 2), "low", 1.0, 1.5, 0)
+    assert low[0][3] == 0.0
+
+
+def test_tide_alert_sub_hourly_linear_interpolation():
+    # 每 30 分钟一个点：交点时刻随之减半（00:15 触发，00:52:30 解除）
+    points = [
+        (BASE + timedelta(minutes=30 * i), h)
+        for i, h in enumerate((0, 2, 0))
+    ]
+    periods = tide_alert_periods(points, "high", 1.0, 0.5, 0)
+    start, end, unclosed, extreme = periods[0]
+    assert start == BASE + timedelta(minutes=15)
+    assert end == BASE + timedelta(minutes=52, seconds=30)
+    assert unclosed is False
+    assert extreme == 2.0

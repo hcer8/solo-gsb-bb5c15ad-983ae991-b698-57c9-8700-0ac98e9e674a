@@ -29,6 +29,12 @@
   （梁底高程 − 潮高 >= 船舶水面以上高度 + 净空富余，等价于对取反潮高序列复用
   达标窗口计算）在预报覆盖时段内按相邻点线性插值判定，等号可通行；求两条件的
   连续交集（相接区间合并）后减去通航时长得到可出发时段，不足时长的舍弃。
+- 港口潮位预警：每港一条规则（high/low 方向 + 触发潮高 + 解除潮高 + 最短持续
+  分钟）。仅在预报覆盖区间 [首点, 末点] 内按相邻点线性插值扫描：首点已达到触发
+  阈值则从首点开始预警，否则首次达到触发阈值（交点作为边界）进入预警，此后须
+  达到解除阈值才结束；覆盖结束仍未解除则该时段未闭合。仅返回持续时间达到最短
+  要求的时段（按起点升序），给出起止时刻、未闭合标记与期间极值潮高（高潮取
+  最高、低潮取最低）。预报不足两点返回空列表。
 """
 from __future__ import annotations
 
@@ -615,3 +621,103 @@ def depth_deficit_audit(
 def _to_utc(ts: float) -> datetime:
     """Unix 秒转 UTC datetime，四舍五入到整秒避免浮点噪声。"""
     return datetime.fromtimestamp(round(ts), tz=timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# 港口潮位预警
+# ---------------------------------------------------------------------------
+
+TIDE_ALERT_HIGH = "high"  # 高潮预警：潮高 ≥ 触发阈值进入，回落到 ≤ 解除阈值结束
+TIDE_ALERT_LOW = "low"    # 低潮预警：潮高 ≤ 触发阈值进入，回升到 ≥ 解除阈值结束
+
+TideAlertPeriod = tuple[datetime, datetime, bool, float]
+# (起点, 终点, 是否未闭合, 期间极值潮高)
+
+
+def tide_alert_periods(
+    points: list[ForecastPoint],
+    direction: str,
+    trigger_height: float,
+    release_height: float,
+    min_duration_seconds: float,
+) -> list[TideAlertPeriod]:
+    """按最新预报（相邻点线性插值）扫描潮位预警时段（纯内存，不改入参）。
+
+    - 仅在预报覆盖区间 [首个预报点, 末个预报点] 内扫描，不外推；不足 2 点
+      返回空列表；
+    - high（高潮预警）：潮高 >= trigger_height 进入预警，回落到
+      <= release_height 才结束（调用方保证 release < trigger）；
+    - low（低潮预警）：潮高 <= trigger_height 进入预警，回升到
+      >= release_height 才结束（调用方保证 release > trigger）；
+    - 首点已达到触发阈值则从首点开始预警，否则首次达到触发阈值的交点作为
+      预警起点；达到解除阈值的交点作为预警终点（等号即解除）；
+    - 覆盖结束（末预报时刻）仍处于预警中则该时段未闭合，终点取末预报时刻；
+    - 仅返回持续时间达到 min_duration_seconds（含等号）的时段，按起点升序；
+    - 期间极值潮高：高潮取时段内最高潮高，低潮取最低潮高。
+    """
+    if len(points) < 2:
+        return []
+
+    ts = [p[0].timestamp() for p in points]
+    hs = [p[1] for p in points]
+
+    if direction == TIDE_ALERT_HIGH:
+        triggered = lambda h: h >= trigger_height - _EPS   # noqa: E731
+        released = lambda h: h <= release_height + _EPS    # noqa: E731
+        more_extreme = max
+    else:
+        triggered = lambda h: h <= trigger_height + _EPS   # noqa: E731
+        released = lambda h: h >= release_height - _EPS    # noqa: E731
+        more_extreme = min
+
+    periods: list[tuple[float, float, bool, float]] = []
+    in_alert = False
+    start_ts = 0.0
+    extreme = hs[0]
+
+    # 首点已达到触发阈值：从首点进入预警
+    if triggered(hs[0]):
+        in_alert = True
+        start_ts = ts[0]
+        extreme = hs[0]
+
+    for i in range(len(points) - 1):
+        t0, t1 = ts[i], ts[i + 1]
+        h0, h1 = hs[i], hs[i + 1]
+        trig0, trig1 = triggered(h0), triggered(h1)
+        rel0, rel1 = released(h0), released(h1)
+
+        if not in_alert:
+            # 寻找首次达到触发阈值的边界（首点已触发的情形已在循环外处理）
+            if trig0:  # 防御：折点恰在触发阈值（通常上一段末已打开）
+                in_alert, start_ts, extreme = True, t0, h0
+            elif trig1:  # 段内首次达到触发阈值：交点作为预警起点
+                in_alert = True
+                start_ts = _cross_time(t0, h0, t1, h1, trigger_height)
+                extreme = trigger_height  # 交点处潮高即触发阈值
+            else:
+                continue
+
+        # 预警中的段：折点潮高都参与极值统计（段内起点交点已以触发阈值计入）
+        if t0 > start_ts + 1e-6:
+            extreme = more_extreme(extreme, h0)
+        # 达到解除阈值：交点作为预警终点并闭合。线性段内只能单向穿越，
+        # 且触发阈值与解除阈值互不相交，同段不会在进入后又于同段解除。
+        if rel1 and not rel0:
+            end_ts = _cross_time(t0, h0, t1, h1, release_height)
+            periods.append((start_ts, end_ts, False, extreme))
+            in_alert = False
+        elif not rel1:
+            extreme = more_extreme(extreme, h1)
+
+    if in_alert:
+        # 覆盖结束仍未解除：未闭合，终点取末预报时刻
+        periods.append((start_ts, ts[-1], True, extreme))
+
+    result = [
+        (_to_utc(s), _to_utc(e), unclosed, extreme_height)
+        for s, e, unclosed, extreme_height in periods
+        if e - s >= min_duration_seconds - _EPS
+    ]
+    result.sort(key=lambda p: p[0])
+    return result

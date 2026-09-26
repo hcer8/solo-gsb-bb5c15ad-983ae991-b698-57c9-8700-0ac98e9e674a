@@ -1,6 +1,6 @@
 """Pydantic 请求/响应模型。"""
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, PlainSerializer, model_validator
 
@@ -320,4 +320,55 @@ class BridgeWindowQueryResult(BaseModel):
     )
     windows: list[DepartureWindow] = Field(
         description="水深与净空两条件连续交集减去通航时长后的全部可出发时段"
+    )
+
+
+class TideAlertRuleUpsert(BaseModel):
+    """设置港口潮位预警规则：每港一条，重复提交即覆盖（更正）。
+
+    - direction = high（高潮预警）：潮高 ≥ trigger_height 进入预警，
+      回落到 ≤ release_height 才解除，要求 release_height < trigger_height；
+    - direction = low（低潮预警）：潮高 ≤ trigger_height 进入预警，
+      回升到 ≥ release_height 才解除，要求 release_height > trigger_height；
+    - min_duration_minutes 为非负的最短持续分钟，持续不足此时长的时段不返回。
+    """
+
+    direction: Literal["high", "low"] = Field(description="预警方向：high（高潮）/ low（低潮）")
+    trigger_height: float = Field(description="触发潮高（米，相对潮高基准面）")
+    release_height: float = Field(description="解除潮高（米，相对潮高基准面）")
+    min_duration_minutes: float = Field(
+        ge=0, description="最短持续分钟（非负）；持续不足此时长的预警时段不返回"
+    )
+
+    @model_validator(mode="after")
+    def _validate_thresholds(self):
+        if self.direction == "high":
+            if not self.release_height < self.trigger_height:
+                raise ValueError("高潮预警的解除潮高必须严格低于触发潮高")
+        else:
+            if not self.release_height > self.trigger_height:
+                raise ValueError("低潮预警的解除潮高必须严格高于触发潮高")
+        return self
+
+
+class TideAlertRuleOut(BaseModel):
+    port_id: int
+    direction: Literal["high", "low"] = Field(description="预警方向：high（高潮）/ low（低潮）")
+    trigger_height: float = Field(description="触发潮高（米）")
+    release_height: float = Field(description="解除潮高（米）")
+    min_duration_minutes: float = Field(description="最短持续分钟")
+
+
+class TideAlertOut(BaseModel):
+    """一条潮位预警时段（按起点升序）。"""
+
+    start: UtcDatetime = Field(description="预警开始时刻（首次达到触发阈值，含首点已达阈值）")
+    end: UtcDatetime = Field(
+        description="预警结束时刻：闭合时为达到解除阈值的时刻；未闭合时为预报覆盖末时刻"
+    )
+    unclosed: bool = Field(
+        description="预报覆盖结束时是否仍未解除（true：未闭合，end 为预报末时刻）"
+    )
+    extreme_height: float = Field(
+        description="预警期间的极值潮高（米）：高潮预警为最高潮高，低潮预警为最低潮高"
     )
