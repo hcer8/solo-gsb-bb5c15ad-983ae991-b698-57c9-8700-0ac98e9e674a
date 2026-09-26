@@ -1684,3 +1684,190 @@ def test_bridge_windows_query_is_read_only(client):
     assert [f["tide_height"] for f in forecasts] == [0.5, 3.0, 0.5]
     got = client.get(f"/ports/{port_id}/bridge").json()
     assert got["bridge_bottom_elevation"] == 27.5
+
+
+# ---------------------------------------------------------------------------
+# 港口潮位预警
+# PUT/GET /ports/{id}/tide-alert-rule、GET /ports/{id}/tide-alerts
+# ---------------------------------------------------------------------------
+
+# 示例港：潮高 0.5→3.0→0.5（00:00/03:00/06:00）
+# 高潮规则：触发 2.5、解除 1.0、最短持续 30 分钟
+ALERT_RULE_HIGH = {
+    "direction": "high",
+    "trigger_height": 2.5,
+    "clear_height": 1.0,
+    "min_duration_minutes": 30,
+}
+
+
+def _put_alert_rule(client, port_id, rule):
+    return client.put(f"/ports/{port_id}/tide-alert-rule", json=rule)
+
+
+def test_alert_rule_put_get_and_overwrite(client):
+    port_id = _setup_port(client)
+    r = _put_alert_rule(client, port_id, ALERT_RULE_HIGH)
+    assert r.status_code == 200
+    assert r.json() == {"port_id": port_id, **ALERT_RULE_HIGH}
+    assert client.get(f"/ports/{port_id}/tide-alert-rule").json() == {
+        "port_id": port_id,
+        **ALERT_RULE_HIGH,
+    }
+
+    # 重复提交即覆盖（更正），每港始终只有一条规则
+    new_rule = {
+        "direction": "low",
+        "trigger_height": 1.0,
+        "clear_height": 2.0,
+        "min_duration_minutes": 0,
+    }
+    r = _put_alert_rule(client, port_id, new_rule)
+    assert r.status_code == 200
+    assert r.json() == {"port_id": port_id, **new_rule}
+    assert client.get(f"/ports/{port_id}/tide-alert-rule").json() == {
+        "port_id": port_id,
+        **new_rule,
+    }
+
+
+def test_alert_rule_404s(client):
+    # 港口不存在
+    assert _put_alert_rule(client, 999, ALERT_RULE_HIGH).status_code == 404
+    assert client.get("/ports/999/tide-alert-rule").status_code == 404
+    # 港口存在但未配置规则 → 404
+    port_id = _setup_port(client)
+    r = client.get(f"/ports/{port_id}/tide-alert-rule")
+    assert r.status_code == 404
+    assert "预警" in r.json()["detail"]
+
+
+def test_alert_rule_validation(client):
+    port_id = _setup_port(client)
+    # 高潮：解除潮高必须严格低于触发潮高（相等或更高均拒绝）
+    for bad_clear in (2.5, 3.0):
+        r = _put_alert_rule(client, port_id, {**ALERT_RULE_HIGH, "clear_height": bad_clear})
+        assert r.status_code == 422
+    # 低潮：解除潮高必须严格高于触发潮高
+    for bad_clear in (1.0, 2.0):
+        r = _put_alert_rule(
+            client, port_id,
+            {"direction": "low", "trigger_height": 2.0,
+             "clear_height": bad_clear, "min_duration_minutes": 0},
+        )
+        assert r.status_code == 422
+    # 最短持续分钟必须非负
+    assert _put_alert_rule(
+        client, port_id, {**ALERT_RULE_HIGH, "min_duration_minutes": -1}
+    ).status_code == 422
+    # 非法方向
+    assert _put_alert_rule(
+        client, port_id, {**ALERT_RULE_HIGH, "direction": "up"}
+    ).status_code == 422
+    # 校验失败不落库：规则仍不存在
+    assert client.get(f"/ports/{port_id}/tide-alert-rule").status_code == 404
+
+
+def test_tide_alerts_high_tide_basic(client):
+    port_id = _setup_port(client)
+    _put_alert_rule(client, port_id, ALERT_RULE_HIGH)
+    r = client.get(f"/ports/{port_id}/tide-alerts")
+    assert r.status_code == 200
+    # 02:24 潮高升至 2.5 进入预警，05:24 降至 1.0 解除，
+    # 持续 180 分钟 ≥ 30，期间最高潮高 3.0
+    assert r.json() == [
+        {
+            "start": "2026-09-24T02:24:00+00:00",
+            "end": "2026-09-24T05:24:00+00:00",
+            "unclosed": False,
+            "extreme_tide_height": 3.0,
+        }
+    ]
+
+
+def test_tide_alerts_min_duration_filters_periods(client):
+    port_id = _setup_port(client)
+    # 预警持续 180 分钟：最短 181 分钟 → 过滤为空
+    _put_alert_rule(client, port_id, {**ALERT_RULE_HIGH, "min_duration_minutes": 181})
+    assert client.get(f"/ports/{port_id}/tide-alerts").json() == []
+    # 恰 180 分钟 → 保留
+    _put_alert_rule(client, port_id, {**ALERT_RULE_HIGH, "min_duration_minutes": 180})
+    assert len(client.get(f"/ports/{port_id}/tide-alerts").json()) == 1
+
+
+def test_tide_alerts_low_direction_first_point_and_unclosed(client):
+    port_id = _setup_port(client)
+    _put_alert_rule(client, port_id, {
+        "direction": "low",
+        "trigger_height": 1.0,
+        "clear_height": 2.0,
+        "min_duration_minutes": 0,
+    })
+    r = client.get(f"/ports/{port_id}/tide-alerts")
+    assert r.status_code == 200
+    # 首点 0.5 已达低潮触发 → 00:00 起预警，01:48 升至 2.0 解除（最低 0.5）；
+    # 05:24 再降至 1.0 触发，覆盖结束仍未解除 → 未闭合（最低 0.5）
+    assert r.json() == [
+        {
+            "start": "2026-09-24T00:00:00+00:00",
+            "end": "2026-09-24T01:48:00+00:00",
+            "unclosed": False,
+            "extreme_tide_height": 0.5,
+        },
+        {
+            "start": "2026-09-24T05:24:00+00:00",
+            "end": "2026-09-24T06:00:00+00:00",
+            "unclosed": True,
+            "extreme_tide_height": 0.5,
+        },
+    ]
+
+
+def test_tide_alerts_recompute_after_forecast_correction(client):
+    port_id = _setup_port(client)
+    _put_alert_rule(client, port_id, ALERT_RULE_HIGH)
+    assert len(client.get(f"/ports/{port_id}/tide-alerts").json()) == 1
+
+    # 更正高潮点 3.0 → 2.0：峰值低于触发阈值 2.5 → 无预警，实时生效
+    client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [{"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 2.0}]},
+    )
+    assert client.get(f"/ports/{port_id}/tide-alerts").json() == []
+
+
+def test_tide_alerts_fewer_than_two_forecasts_returns_empty(client):
+    r = client.post("/ports", json={"name": "无预报港", "reference_depth": 4.0})
+    port_id = r.json()["id"]
+    _put_alert_rule(client, port_id, ALERT_RULE_HIGH)
+    # 无预报点
+    assert client.get(f"/ports/{port_id}/tide-alerts").json() == []
+    # 仅 1 个预报点（无插值区间）
+    client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [{"forecast_time": "2026-09-24T00:00:00Z", "tide_height": 3.0}]},
+    )
+    assert client.get(f"/ports/{port_id}/tide-alerts").json() == []
+
+
+def test_tide_alerts_404s(client):
+    # 港口不存在
+    assert client.get("/ports/999/tide-alerts").status_code == 404
+    # 港口存在但未配置规则 → 404
+    port_id = _setup_port(client)
+    r = client.get(f"/ports/{port_id}/tide-alerts")
+    assert r.status_code == 404
+    assert "预警" in r.json()["detail"]
+
+
+def test_tide_alerts_query_is_read_only(client):
+    port_id = _setup_port(client)
+    _put_alert_rule(client, port_id, ALERT_RULE_HIGH)
+    client.get(f"/ports/{port_id}/tide-alerts")
+    # 查询只读：预报点与预警规则均不变
+    forecasts = client.get(f"/ports/{port_id}/tide-forecasts").json()
+    assert [f["tide_height"] for f in forecasts] == [0.5, 3.0, 0.5]
+    assert client.get(f"/ports/{port_id}/tide-alert-rule").json() == {
+        "port_id": port_id,
+        **ALERT_RULE_HIGH,
+    }

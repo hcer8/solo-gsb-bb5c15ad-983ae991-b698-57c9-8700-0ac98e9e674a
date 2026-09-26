@@ -54,6 +54,15 @@ CREATE TABLE IF NOT EXISTS bridge_configs (
     bridge_bottom_elevation REAL NOT NULL        -- 梁底高程（米，相对潮高基准面）
 );
 
+CREATE TABLE IF NOT EXISTS tide_alert_rules (
+    port_id              INTEGER PRIMARY KEY  -- 每港一条潮位预警规则
+        REFERENCES ports(id) ON DELETE CASCADE,
+    direction            TEXT    NOT NULL,    -- high（高潮）/ low（低潮）
+    trigger_height       REAL    NOT NULL,    -- 触发潮高（米，相对海图基准面）
+    clear_height         REAL    NOT NULL,    -- 解除潮高（米，相对海图基准面）
+    min_duration_minutes REAL    NOT NULL     -- 最短持续分钟（非负）
+);
+
 CREATE INDEX IF NOT EXISTS idx_tide_observations_port
     ON tide_observations (port_id, obs_time);
 

@@ -1,6 +1,6 @@
 """Pydantic 请求/响应模型。"""
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, PlainSerializer, model_validator
 
@@ -320,4 +320,49 @@ class BridgeWindowQueryResult(BaseModel):
     )
     windows: list[DepartureWindow] = Field(
         description="水深与净空两条件连续交集减去通航时长后的全部可出发时段"
+    )
+
+
+class TideAlertRuleUpsert(BaseModel):
+    """设置潮位预警规则：每港一条，重复提交即覆盖（更正）。"""
+
+    direction: Literal["high", "low"] = Field(
+        description="预警方向：high=高潮（潮高升至触发潮高进入预警），"
+        "low=低潮（潮高降至触发潮高进入预警）"
+    )
+    trigger_height: float = Field(description="触发潮高（米，相对海图基准面）")
+    clear_height: float = Field(description="解除潮高（米，相对海图基准面）")
+    min_duration_minutes: float = Field(
+        ge=0, description="最短持续分钟（非负；持续不足该时长的预警时段不返回）"
+    )
+
+    @model_validator(mode="after")
+    def _validate_thresholds(self):
+        if self.direction == "high" and self.clear_height >= self.trigger_height:
+            raise ValueError("高潮预警的解除潮高必须低于触发潮高")
+        if self.direction == "low" and self.clear_height <= self.trigger_height:
+            raise ValueError("低潮预警的解除潮高必须高于触发潮高")
+        return self
+
+
+class TideAlertRuleOut(BaseModel):
+    port_id: int
+    direction: str = Field(description="预警方向：high=高潮 / low=低潮")
+    trigger_height: float = Field(description="触发潮高（米，相对海图基准面）")
+    clear_height: float = Field(description="解除潮高（米，相对海图基准面）")
+    min_duration_minutes: float = Field(description="最短持续分钟（非负）")
+
+
+class TideAlertPeriod(BaseModel):
+    """一段潮位预警时段（按起点升序）。"""
+
+    start: UtcDatetime = Field(
+        description="预警开始时刻（首次达到触发潮高的交点；首点已触发则为首预报时刻）"
+    )
+    end: UtcDatetime = Field(
+        description="预警结束时刻（达到解除潮高的交点；未闭合时为末个预报时刻）"
+    )
+    unclosed: bool = Field(description="预报覆盖结束时预警是否仍未解除")
+    extreme_tide_height: float = Field(
+        description="预警期间极值潮高（米）：高潮预警为期间最高潮高，低潮预警为期间最低潮高"
     )
